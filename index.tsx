@@ -1,841 +1,693 @@
-import { useContext, useEffect, useMemo, useState } from "react";
-import { useTranslation } from "react-i18next";
-import { Globe } from "lucide-react";
-import { api } from "@/controllers/API/api";
-import { getURL } from "@/controllers/API/helpers/constants";
+import Fuse from "fuse.js";
+import { cloneDeep } from "lodash";
 import {
-  type ReleaseRecord,
-  useGetCurrentRelease,
-  useGetReleaseDocumentPreview,
-  useGetReleasePackageComparison,
-  useGetReleases,
-  usePostBumpReleaseWithDocument,
-} from "@/controllers/API/queries/releases";
-import { AuthContext } from "@/contexts/authContext";
-import useAlertStore from "@/stores/alertStore";
-import useRegionStore from "@/stores/regionStore";
+  createContext,
+  memo,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { useHotkeys } from "react-hotkeys-hook";
+import { useShallow } from "zustand/react/shallow";
+import ForwardedIconComponent from "@/components/common/genericIconComponent";
 import { Button } from "@/components/ui/button";
+import { useTranslation } from 'react-i18next';
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import Loading from "@/components/ui/loading";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Textarea } from "@/components/ui/textarea";
+  Sidebar,
+  SidebarContent,
+  useSidebar,
+} from "@/components/ui/sidebar";
+import SkeletonGroup from "@/components/ui/skeletonGroup";
+import { useGetMCPServers } from "@/controllers/API/queries/mcp/use-get-mcp-servers";
+import { ENABLE_NEW_SIDEBAR } from "@/customization/feature-flags";
+import { useAddComponent } from "@/hooks/use-add-component";
+import { useShortcutsStore } from "@/stores/shortcuts";
+import { setLocalStorage } from "@/utils/local-storage-util";
+import {
+  nodeColors,
+  SIDEBAR_BUNDLES,
+  SIDEBAR_CATEGORIES,
+} from "@/utils/styleUtils";
+import { cn, getBooleanFromStorage } from "@/utils/utils";
+import useAgentStore from "../../../../stores/agentStore";
+import { useTypesStore } from "../../../../stores/typesStore";
+import type { APIClassType } from "../../../../types/api";
+import isWrappedWithClass from "../PageComponent/utils/is-wrapped-with-class";
+import { CategoryGroup } from "./components/categoryGroup";
+import NoResultsMessage from "./components/emptySearchComponent";
+import McpSidebarGroup from "./components/McpSidebarPanel";
+import MemoizedSidebarGroup from "./components/sidebarBundles";
+import { SidebarHeaderComponent } from "./components/sidebarHeader";
+import { applyBetaFilter } from "./helpers/apply-beta-filter";
+import { applyComponentFilter } from "./helpers/apply-component-filter";
+import { applyEdgeFilter } from "./helpers/apply-edge-filter";
+import { applyLegacyFilter } from "./helpers/apply-legacy-filter";
+import { combinedResultsFn } from "./helpers/combined-results";
+import { filteredDataFn } from "./helpers/filtered-data";
+import { normalizeString } from "./helpers/normalize-string";
+import sensitiveSort from "./helpers/sensitive-sort";
+import { traditionalSearchMetadata } from "./helpers/traditional-search-metadata";
+import { t } from "i18next";
 
-const ACTIVE_END_DATE = "9999-12-31";
+const CATEGORIES = SIDEBAR_CATEGORIES;
+const BUNDLES = SIDEBAR_BUNDLES;
 
-type BumpType = "major" | "minor" | "patch";
-type PackageViewTab = "managed" | "transitive";
+// Search context for the sidebar
+export type SearchContextType = {
+  focusSearch: () => void;
+  isSearchFocused: boolean;
+  // Additional properties for the sidebar to use
+  search?: string;
+  setSearch?: (value: string) => void;
+  searchInputRef?: React.RefObject<HTMLInputElement>;
+  handleInputFocus?: () => void;
+  handleInputBlur?: () => void;
+  handleInputChange?: (event: React.ChangeEvent<HTMLInputElement>) => void;
+};
 
-const BUMP_OPTIONS: { value: BumpType; label: string; description: string }[] = [
-  { value: "major", label: "Major", description: "Breaking release" },
-  { value: "minor", label: "Minor", description: "Feature release" },
-  { value: "patch", label: "Patch", description: "Fix release" },
-];
+export const SearchContext = createContext<SearchContextType | null>(null);
 
-function formatDate(value?: string | null) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleDateString();
+export function useSearchContext() {
+  const context = useContext(SearchContext);
+  if (!context) {
+    throw new Error("useSearchContext must be used within SearchProvider");
+  }
+  return context;
 }
 
-function formatDateTime(value?: string | null) {
-  if (!value) return "-";
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return "-";
-  return date.toLocaleString();
-}
-
-function formatFileSize(size?: number | null) {
-  if (!size || size <= 0) return "-";
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatComparisonStatus(status: string) {
-  if (status === "unchanged") return "Unchanged";
-  if (status === "upgraded") return "Upgraded";
-  if (status === "downgraded") return "Downgraded";
-  if (status === "new") return "New";
-  if (status === "removed") return "Removed";
-  return "Changed";
-}
-
-function comparisonStatusClass(status: string) {
-  if (status === "unchanged") return "border-slate-300 text-slate-600";
-  if (status === "upgraded") return "border-green-500/50 text-green-600";
-  if (status === "downgraded") return "border-amber-500/50 text-amber-600";
-  if (status === "new") return "border-blue-500/50 text-blue-600";
-  if (status === "removed") return "border-red-500/50 text-red-600";
-  return "border-violet-500/50 text-violet-600";
-}
-
-function ReleaseLibrariesTab({
-  releaseId,
-  regionCode,
+// Create a provider that can be used at the AgentBuilderPage level
+export function AgentSearchProvider({
+  children,
 }: {
-  releaseId: string;
-  regionCode?: string | null;
+  children: React.ReactNode;
 }) {
   const { t } = useTranslation();
-  const [selectedService, setSelectedService] = useState("all");
-  const [activeTab, setActiveTab] = useState<PackageViewTab>("managed");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [showChangedOnly, setShowChangedOnly] = useState(false);
-  const { data: comparisonData, isLoading } = useGetReleasePackageComparison(
-    { releaseId, service: selectedService, regionCode },
-  );
+  const [search, setSearch] = useState("");
+  const [isInputFocused, setIsInputFocused] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
 
-  const normalizedData = useMemo(
-    () =>
-      (comparisonData ?? []).map((row) => ({
-        ...row,
-        service_name: row.service_name || "unknown",
-        released_version: row.released_version || "",
-        released_version_spec: row.released_version_spec || "",
-        current_version: row.current_version || "",
-        current_version_spec: row.current_version_spec || "",
-        status: row.status || "unchanged",
-      })),
-    [comparisonData],
-  );
+  const focusSearchInput = useCallback(() => {
+    if (searchInputRef.current) {
+      searchInputRef.current.focus();
+    }
+  }, []);
 
-  const managedPackages = normalizedData.filter((row) => row.package_type === "managed");
-  const transitivePackages = normalizedData.filter((row) => row.package_type === "transitive");
-  const visiblePackages = activeTab === "managed" ? managedPackages : transitivePackages;
-  const serviceOptions = useMemo(() => {
-    const values = Array.from(new Set(normalizedData.map((row) => row.service_name))).sort();
-    return ["all", ...values];
-  }, [normalizedData]);
+  const handleInputFocus = useCallback(() => {
+    setIsInputFocused(true);
+  }, []);
 
-  const filteredPackages = visiblePackages.filter((row) => {
-    const q = searchQuery.trim().toLowerCase();
-    const matchesSearch =
-      !q ||
-      (
-      row.name.toLowerCase().includes(q) ||
-      row.service_name.toLowerCase().includes(q) ||
-      row.released_version.toLowerCase().includes(q) ||
-      row.released_version_spec.toLowerCase().includes(q) ||
-      row.current_version.toLowerCase().includes(q) ||
-      row.current_version_spec.toLowerCase().includes(q) ||
-      row.status.toLowerCase().includes(q)
-      );
-    const matchesDelta = showChangedOnly ? row.status !== "unchanged" : true;
-    return matchesSearch && matchesDelta;
-  });
+  const handleInputBlur = useCallback(() => {
+    setIsInputFocused(false);
+  }, []);
 
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loading />
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-4">
-      <div className="grid gap-3 rounded-lg border border-border bg-card p-4 lg:grid-cols-[auto_12rem_minmax(0,1fr)_auto] lg:items-center">
-        <div className="flex flex-wrap gap-2">
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab("managed");
-              setSearchQuery("");
-            }}
-            className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors ${
-              activeTab === "managed"
-                ? "bg-background text-foreground ring-1 ring-border"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {t("Managed")}
-            <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{managedPackages.length}</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab("transitive");
-              setSearchQuery("");
-            }}
-            className={`inline-flex items-center gap-2 rounded-md px-3 py-1.5 text-sm transition-colors ${
-              activeTab === "transitive"
-                ? "bg-background text-foreground ring-1 ring-border"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            {t("Transitive")}
-            <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{transitivePackages.length}</span>
-          </button>
-        </div>
-        <select
-          value={selectedService}
-          onChange={(e) => setSelectedService(e.target.value)}
-          className="h-10 rounded-md border border-border bg-background px-3 text-sm text-foreground focus:border-ring focus:outline-none focus:ring-1 focus:ring-ring"
-        >
-          {serviceOptions.map((serviceName) => (
-            <option key={serviceName} value={serviceName}>
-              {serviceName === "all" ? t("All Services") : serviceName}
-            </option>
-          ))}
-        </select>
-        <input
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder={
-            activeTab === "managed" ? t("Search managed packages...") : t("Search transitive packages...")
-          }
-          className="h-10 w-full rounded-md border border-border bg-background px-3 text-sm text-foreground outline-none ring-offset-background placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring"
-        />
-        <button
-          type="button"
-          onClick={() => setShowChangedOnly((current) => !current)}
-          className={`h-10 rounded-md border px-3 text-sm transition-colors ${
-            showChangedOnly
-              ? "border-border bg-muted text-foreground"
-              : "border-border bg-background text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {showChangedOnly ? t("Showing Changed Only") : t("Show Changed Only")}
-        </button>
-      </div>
-
-      <div className="max-h-[60vh] overflow-auto rounded-lg border border-border bg-card">
-        <table className="w-full min-w-[980px] text-sm">
-          <thead className="sticky top-0 z-10 bg-card">
-            <tr className="border-b border-border bg-muted/30 text-xs text-muted-foreground">
-              <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider">{t("Package")}</th>
-              <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider">{t("Service")}</th>
-              {activeTab === "managed" && (
-                <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider">{t("Released Spec")}</th>
-              )}
-              <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider">{t("Released Version")}</th>
-              <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider">{t("Current Version")}</th>
-              <th className="px-4 py-3 text-left font-semibold uppercase tracking-wider">{t("Status")}</th>
-            </tr>
-          </thead>
-          <tbody>
-            {filteredPackages.length === 0 ? (
-              <tr>
-                <td
-                  colSpan={activeTab === "managed" ? 6 : 5}
-                  className="px-4 py-10 text-center text-sm text-muted-foreground"
-                >
-                  {searchQuery ? t("No packages match your search.") : t("No packages found in this view.")}
-                </td>
-              </tr>
-            ) : (
-              filteredPackages.map((row) => (
-                <tr
-                  key={`${row.service_name}-${row.package_type}-${row.name}`}
-                  className="border-b border-border/30 align-top last:border-b-0 hover:bg-muted/20"
-                >
-                  <td className="px-4 py-3 font-mono text-sm" title={row.name}>{row.name}</td>
-                  <td className="px-4 py-3 text-muted-foreground">{row.service_name}</td>
-                  {activeTab === "managed" && (
-                    <td className="px-4 py-3 text-muted-foreground">{row.released_version_spec || "-"}</td>
-                  )}
-                  <td className="px-4 py-3">{row.released_version || "-"}</td>
-                  <td className="px-4 py-3">{row.current_version || "-"}</td>
-                  <td className="px-4 py-3">
-                    <span
-                      className={`inline-flex rounded-full border px-2.5 py-0.5 text-xs font-medium ${comparisonStatusClass(row.status)}`}
-                    >
-                      {t(formatComparisonStatus(row.status))}
-                    </span>
-                  </td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-function ReleaseDocumentTab({ release, regionCode }: { release: ReleaseRecord; regionCode?: string | null }) {
-  const { t } = useTranslation();
-  const { data, isLoading } = useGetReleaseDocumentPreview({ releaseId: release.id, regionCode });
-  const [showFallbackPreview, setShowFallbackPreview] = useState(false);
-  const [showViewerAssist, setShowViewerAssist] = useState(false);
-
-  useEffect(() => {
-    setShowFallbackPreview(false);
-    setShowViewerAssist(false);
-  }, [release.id]);
-
-  useEffect(() => {
-    if (!data?.office_viewer_url || showFallbackPreview) return;
-    const timer = window.setTimeout(() => {
-      setShowViewerAssist(true);
-    }, 5000);
-    
-    return () => window.clearTimeout(timer);
-  }, [data?.office_viewer_url, showFallbackPreview]);
-
-  const handleDownload = async () => {
-    const response = await api.get(`${getURL("RELEASES")}/${release.id}/document/download`, {
-      responseType: "blob",
-      ...(regionCode ? { headers: { "X-Region-Code": regionCode } } : {}),
-    });
-    const blob = new Blob([response.data], {
-      type: release.document_content_type ?? "application/octet-stream",
-    });
-    const url = window.URL.createObjectURL(blob);
-    const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = release.document_file_name ?? `${release.version}.docx`;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    window.URL.revokeObjectURL(url);
-  };
-
-  if (isLoading) {
-    return (
-      <div className="flex items-center justify-center py-12">
-        <Loading />
-      </div>
-    );
-  }
-
-  if (!data?.has_document) {
-    return (
-      <div className="rounded-lg border border-dashed border-border bg-muted/10 p-8 text-center text-sm text-muted-foreground">
-        {t("No release document is available for this release.")}
-      </div>
-    );
-  }
-
-  const officeViewerUrl = data.office_viewer_url || "";
-  const canTryOfficeViewer = Boolean(officeViewerUrl) && !showFallbackPreview;
-
-  return (
-    <div className="space-y-4">
-      <div className="flex flex-col gap-3 rounded-lg border border-border bg-card p-4 md:flex-row md:items-center md:justify-between">
-        <div className="min-w-0 space-y-1">
-          <div className="truncate text-sm font-medium text-foreground" title={data.file_name || release.document_file_name || ""}>
-            {data.file_name || release.document_file_name}
-          </div>
-          <div className="text-xs text-muted-foreground">
-            {t("Uploaded")}: {formatDateTime(data.document_uploaded_at || release.document_uploaded_at)}
-            {" • "}
-            {t("Size")}: {formatFileSize(data.document_size || release.document_size)}
-          </div>
-        </div>
-        <div className="flex flex-wrap gap-2">
-          {officeViewerUrl && (
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => window.open(officeViewerUrl, "_blank", "noopener,noreferrer")}
-            >
-              {t("Open in Word Viewer")}
-            </Button>
-          )}
-          <Button type="button" variant="outline" onClick={handleDownload}>
-            {t("Download Document")}
-          </Button>
-        </div>
-      </div>
-
-      {canTryOfficeViewer ? (
-        <div className="space-y-3">
-          {showViewerAssist && (
-            <div className="flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 md:flex-row md:items-center md:justify-between">
-              <div>
-                {t("If the Word-style preview does not open correctly, switch to the fallback preview or download the document.")}
-              </div>
-              <Button type="button" variant="outline" onClick={() => setShowFallbackPreview(true)}>
-                {t("Use Fallback Preview")}
-              </Button>
-            </div>
-          )}
-          <div className="overflow-hidden rounded-lg border border-border bg-card">
-            <iframe
-              title={data.file_name || release.document_file_name || "Release Document"}
-              src={officeViewerUrl}
-              className="h-[72vh] w-full"
-            />
-          </div>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
-            {officeViewerUrl
-              ? t("Word-style preview could not be used for this document. Showing fallback document preview.")
-              : t("Office-style preview is unavailable in this environment. Showing fallback document preview.")}
-          </div>
-          <div className="rounded-lg border border-border bg-card p-6">
-            <div
-              className="release-doc-html prose prose-sm max-w-none text-foreground [&_h1]:mb-3 [&_h1]:text-xl [&_h1]:font-semibold [&_h2]:mb-2 [&_h2]:mt-5 [&_h2]:text-lg [&_h2]:font-semibold [&_h3]:mb-2 [&_h3]:mt-4 [&_h3]:text-base [&_h3]:font-semibold [&_p]:mb-3 [&_table]:mb-4 [&_table]:w-full [&_table]:border-collapse [&_td]:border [&_td]:border-border [&_td]:px-3 [&_td]:py-2"
-              dangerouslySetInnerHTML={{ __html: data.html }}
-            />
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
-function ViewReleaseDialog({
-  release,
-  open,
-  onOpenChange,
-  regionCode,
-}: {
-  release: ReleaseRecord | null;
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  regionCode?: string | null;
-}) {
-  const { t } = useTranslation();
-  const [activeTab, setActiveTab] = useState("document");
-
-  if (!release) return null;
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-h-[90vh] max-w-6xl overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>{t("Release {{version}}", { version: release.version })}</DialogTitle>
-          <DialogDescription>
-            {release.release_notes || t("Review the uploaded release document and the captured library snapshot.")}
-          </DialogDescription>
-        </DialogHeader>
-
-        <Tabs key={release.id} value={activeTab} onValueChange={setActiveTab} className="space-y-4">
-          <TabsList className="grid w-full grid-cols-2 rounded-lg border border-border bg-card p-1">
-            <TabsTrigger value="document">{t("Release Document")}</TabsTrigger>
-            <TabsTrigger value="libraries">{t("Packages")}</TabsTrigger>
-          </TabsList>
-
-          <TabsContent value="document" className="space-y-4">
-            <ReleaseDocumentTab release={release} regionCode={regionCode} />
-          </TabsContent>
-
-          <TabsContent value="libraries" className="space-y-4">
-            <ReleaseLibrariesTab releaseId={release.id} regionCode={regionCode} />
-          </TabsContent>
-        </Tabs>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-function CreateReleaseDialog({
-  open,
-  onOpenChange,
-  regionCode,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  regionCode?: string | null;
-}) {
-  const { t } = useTranslation();
-  const { setSuccessData, setErrorData } = useAlertStore();
-  const [bumpType, setBumpType] = useState<BumpType>("patch");
-  const [notes, setNotes] = useState("");
-  const [documentFile, setDocumentFile] = useState<File | null>(null);
-  const [selectedFileName, setSelectedFileName] = useState("");
-
-  const createReleaseMutation = usePostBumpReleaseWithDocument({
-    onSuccess: () => {
-      setSuccessData({ title: t("Release created successfully.") });
-      setNotes("");
-      setDocumentFile(null);
-      setSelectedFileName("");
-      setBumpType("patch");
-      onOpenChange(false);
+  const handleInputChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      setSearch(event.target.value);
     },
-    onError: (err: any) => {
-      setErrorData({
-        title: err?.response?.data?.detail || err?.message || t("Failed to create release."),
+    [],
+  );
+
+  const searchContextValue = useMemo(
+    () => ({
+      focusSearch: focusSearchInput,
+      isSearchFocused: isInputFocused,
+      // Also expose the search state and handlers for the sidebar to use
+      search,
+      setSearch,
+      searchInputRef,
+      handleInputFocus,
+      handleInputBlur,
+      handleInputChange,
+    }),
+    [
+      focusSearchInput,
+      isInputFocused,
+      search,
+      handleInputFocus,
+      handleInputBlur,
+      handleInputChange,
+    ],
+  );
+
+  return (
+    <SearchContext.Provider value={searchContextValue}>
+      {children}
+    </SearchContext.Provider>
+  );
+}
+
+interface AgentSidebarComponentProps {
+  isLoading?: boolean;
+  showLegacy?: boolean;
+  setShowLegacy?: (value: boolean) => void;
+  readOnly?: boolean;
+}
+
+export function AgentSidebarComponent({ isLoading, readOnly = false }: AgentSidebarComponentProps) {
+  const data = useTypesStore((state) => state.data);
+  const { t } = useTranslation();
+  const {
+    getFilterEdge,
+    setFilterEdge,
+    filterType,
+    getFilterComponent,
+    setFilterComponent,
+  } = useAgentStore(
+    useShallow((state) => ({
+      getFilterEdge: state.getFilterEdge,
+      setFilterEdge: state.setFilterEdge,
+      filterType: state.filterType,
+      getFilterComponent: state.getFilterComponent,
+      setFilterComponent: state.setFilterComponent,
+    })),
+  );
+
+  const { activeSection, setOpen, setActiveSection } = useSidebar();
+  const addComponent = useAddComponent();
+  const addComponentSafe = readOnly ? undefined : addComponent;
+
+  // Get MCP servers for search functionality (only when new sidebar is enabled)
+  const {
+    data: mcpServers,
+    isLoading: mcpLoading,
+    isSuccess: mcpSuccess,
+  } = useGetMCPServers({ enabled: ENABLE_NEW_SIDEBAR });
+
+  // Get search state from context
+  const context = useSearchContext();
+  // Unconditional fallback ref to satisfy Rules of Hooks
+  const fallbackSearchInputRef = useRef<HTMLInputElement | null>(null);
+  const {
+    search = "",
+    setSearch = () => {},
+    searchInputRef = fallbackSearchInputRef,
+    isSearchFocused = false,
+    handleInputFocus = () => {},
+    handleInputBlur = () => {},
+    handleInputChange: originalHandleInputChange = () => {},
+  } = context;
+
+  const handleInputChange = useCallback(
+    (event: React.ChangeEvent<HTMLInputElement>) => {
+      originalHandleInputChange(event);
+      // Set active section to search when user first enters text
+      if (event.target.value.length > 0 && search.length === 0) {
+        setActiveSection("search");
+      }
+    },
+    [originalHandleInputChange, search, setActiveSection],
+  );
+
+  const showBetaStorage = getBooleanFromStorage("showBeta", true);
+  const showLegacyStorage = getBooleanFromStorage("showLegacy", false);
+
+  // State
+  const [fuse, setFuse] = useState<Fuse<any> | null>(null);
+  const [openCategories, setOpenCategories] = useState<string[]>([]);
+  const [showConfig, setShowConfig] = useState(false);
+  const [showBeta, setShowBeta] = useState(showBetaStorage);
+  const [showLegacy, setShowLegacy] = useState(showLegacyStorage);
+
+  // Functions to handle state changes with localStorage persistence
+  const handleSetShowBeta = useCallback((value: boolean) => {
+    setShowBeta(value);
+    setLocalStorage("showBeta", value.toString());
+  }, []);
+
+  const handleSetShowLegacy = useCallback((value: boolean) => {
+    setShowLegacy(value);
+    setLocalStorage("showLegacy", value.toString());
+  }, []);
+  const [mcpSearchData, setMcpSearchData] = useState<any[]>([]);
+
+  // Create base data that includes MCP category when available
+  const baseData = useMemo(() => {
+    if (mcpSuccess && mcpServers && data["agents"]?.["MCPTools"]) {
+      const mcpComponent = data["agents"]["MCPTools"];
+      const newMcpSearchData = mcpServers.map((mcpServer) => ({
+        ...mcpComponent,
+        display_name: mcpServer.name,
+        description: `MCP Server: ${mcpServer.name}`,
+        category: "MCP",
+        key: `mcp_${mcpServer.name}`,
+        template: {
+          ...mcpComponent.template,
+          mcp_server: {
+            ...mcpComponent.template.mcp_server,
+            value: mcpServer,
+          },
+        },
+      }));
+
+      const mcpCategoryData: Record<string, any> = {};
+      newMcpSearchData.forEach((mcp) => {
+        mcpCategoryData[mcp.display_name] = mcp;
       });
+
+      return {
+        ...data,
+        MCP: mcpCategoryData,
+      };
+    }
+    return data;
+  }, [data, mcpSuccess, mcpServers]);
+
+  const [dataFilter, setFilterData] = useState(baseData);
+
+  const customComponent = useMemo(() => {
+    return data?.["custom_component"]?.["CustomComponent"] ?? null;
+  }, [data]);
+
+  const searchResults = useMemo(() => {
+    if (!search || !fuse) return null;
+
+    const searchTerm = normalizeString(search);
+    const fuseResults = fuse.search(search).map((result) => ({
+      ...result,
+      item: { ...result.item, score: result.score },
+    }));
+
+    const fuseCategories = fuseResults.map((result) => result.item.category);
+    const combinedResults = combinedResultsFn(fuseResults, baseData);
+    const traditionalResults = traditionalSearchMetadata(baseData, searchTerm);
+
+    return {
+      fuseResults,
+      fuseCategories,
+      combinedResults,
+      traditionalResults,
+    };
+  }, [search, fuse, baseData]);
+
+  const searchFilteredData = useMemo(() => {
+    if (!search || !searchResults) return cloneDeep(baseData);
+
+    const filteredData = filteredDataFn(
+      baseData,
+      searchResults.combinedResults,
+      searchResults.traditionalResults,
+    );
+
+    return filteredData;
+  }, [baseData, search, searchResults]);
+
+  const sortedCategories = useMemo(() => {
+    if (!searchResults || !searchFilteredData) return [];
+
+    return Object.keys(searchFilteredData).toSorted((a, b) =>
+      searchResults.fuseCategories.indexOf(b) <
+      searchResults.fuseCategories.indexOf(a)
+        ? 1
+        : -1,
+    );
+  }, [searchResults, searchFilteredData, CATEGORIES, BUNDLES]);
+
+  const finalFilteredData = useMemo(() => {
+    let filteredData = searchFilteredData;
+
+    if (getFilterEdge?.length > 0) {
+      filteredData = applyEdgeFilter(filteredData, getFilterEdge);
+    }
+
+    if (getFilterComponent !== "") {
+      filteredData = applyComponentFilter(filteredData, getFilterComponent);
+    }
+
+    if (!showBeta) {
+      filteredData = applyBetaFilter(filteredData);
+    }
+
+    if (!showLegacy) {
+      filteredData = applyLegacyFilter(filteredData);
+    }
+
+    return filteredData;
+  }, [
+    searchFilteredData,
+    getFilterEdge,
+    getFilterComponent,
+    showBeta,
+    showLegacy,
+  ]);
+
+  const hasResults = useMemo(() => {
+    return Object.entries(dataFilter).some(
+      ([category, items]) =>
+        (Object.keys(items).length > 0 &&
+          (CATEGORIES.find((c) => c.name === category) ||
+            BUNDLES.find((b) => b.name === category))) ||
+        (dataFilter["MCP"] && Object.keys(dataFilter["MCP"]).length > 0),
+    );
+  }, [dataFilter]);
+
+  const handleKeyDownInput = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>, name: string) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        setOpenCategories((prev) =>
+          prev.includes(name)
+            ? prev.filter((cat) => cat !== name)
+            : [...prev, name],
+        );
+      }
     },
-  });
-
-  const handleSubmit = () => {
-    if (!documentFile) {
-      setErrorData({ title: t("Please upload a .docx release document.") });
-      return;
-    }
-    createReleaseMutation.mutate({
-      bump_type: bumpType,
-      release_notes: notes,
-      document_file: documentFile,
-      regionCode,
-    });
-  };
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl">
-        <DialogHeader>
-          <DialogTitle>{t("Create Release")}</DialogTitle>
-          <DialogDescription>
-            {t("Publish a new release version with an uploaded Word document and the current library snapshot.")}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-6 py-2">
-          <div className="space-y-2">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">{t("Version Bump")}</p>
-            <div className="grid gap-3 sm:grid-cols-3">
-              {BUMP_OPTIONS.map((option) => (
-                <button
-                  key={option.value}
-                  type="button"
-                  onClick={() => setBumpType(option.value)}
-                  className={`rounded-lg border px-4 py-3 text-left transition-colors ${
-                    bumpType === option.value
-                      ? "border-primary bg-primary/5 text-foreground"
-                      : "border-border bg-card text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  <div className="font-medium">{t(option.label)}</div>
-                  <div className="mt-1 text-xs">{t(option.description)}</div>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">{t("Release Notes")}</p>
-            <Textarea
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              rows={4}
-              placeholder={t("Add an optional release summary.")}
-            />
-          </div>
-
-          <div className="space-y-2">
-            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-muted-foreground">{t("Release Document")}</p>
-            <div className="rounded-lg border border-dashed border-border bg-muted/10 p-4">
-              <label
-                htmlFor="release-document-upload"
-                className="flex cursor-pointer items-center justify-between gap-3 rounded-md border border-border bg-background px-4 py-3 transition-colors hover:border-primary/40"
-              >
-                <div className="min-w-0">
-                  <div className="truncate text-sm font-medium text-foreground" title={selectedFileName}>
-                    {selectedFileName || t("Select release document")}
-                  </div>
-                  <div className="mt-1 text-xs text-muted-foreground">
-                    {documentFile
-                      ? `${formatFileSize(documentFile.size)} • .docx`
-                      : t("Upload one Word document for this release")}
-                  </div>
-                </div>
-                <span className="shrink-0 rounded-md border border-border bg-muted px-3 py-2 text-sm font-medium text-foreground">
-                  {t("Choose File")}
-                </span>
-              </label>
-              <input
-                id="release-document-upload"
-                type="file"
-                accept=".docx"
-                className="hidden"
-                onChange={(e) => {
-                  const file = e.target.files?.[0] ?? null;
-                  setDocumentFile(file);
-                  setSelectedFileName(file?.name ?? "");
-                }}
-              />
-              <p className="mt-2 text-xs text-muted-foreground">
-                {documentFile ? (
-                  <span title={documentFile.name}>{documentFile.name}</span>
-                ) : (
-                  t("Only .docx files are supported. The document will be stored securely in release documents.")
-                )}
-              </p>
-            </div>
-          </div>
-
-          <div className="flex justify-end gap-2">
-            <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>
-              {t("Cancel")}
-            </Button>
-            <Button type="button" onClick={handleSubmit} disabled={createReleaseMutation.isPending}>
-              {createReleaseMutation.isPending ? t("Creating...") : t("Create Release")}
-            </Button>
-          </div>
-        </div>
-      </DialogContent>
-    </Dialog>
-  );
-}
-
-export default function ReleaseManagementPage() {
-  const { t } = useTranslation();
-  const { permissions, userData } = useContext(AuthContext);
-  const normalizedRole = String(userData?.role || "").trim().toLowerCase();
-  const isRootAdmin = normalizedRole === "root";
-  const regions = useRegionStore((s) => s.regions);
-  const selectedRegionCode = useRegionStore((s) => s.selectedRegionCode);
-  const setSelectedRegion = useRegionStore((s) => s.setSelectedRegion);
-  const fetchRegions = useRegionStore((s) => s.fetchRegions);
-  const releaseRegionCode = isRootAdmin ? selectedRegionCode : null;
-  const { data: currentRelease, isLoading: isCurrentLoading } = useGetCurrentRelease({ regionCode: releaseRegionCode });
-  const { data: releases = [], isLoading: isReleasesLoading } = useGetReleases({ regionCode: releaseRegionCode });
-  const [createOpen, setCreateOpen] = useState(false);
-  const [selectedRelease, setSelectedRelease] = useState<ReleaseRecord | null>(null);
-
-  useEffect(() => {
-    if (isRootAdmin) {
-      fetchRegions();
-    }
-  }, [isRootAdmin, fetchRegions]);
-
-  const isRemoteRegion = useMemo(() => {
-    if (!isRootAdmin || !selectedRegionCode || !regions.length) return false;
-    const hub = regions.find((r) => r.is_hub);
-    return hub ? hub.code !== selectedRegionCode : false;
-  }, [isRootAdmin, selectedRegionCode, regions]);
-
-  const canPublishRelease = permissions?.includes("publish_release");
-  const pageTitle = isRootAdmin ? t("Release Management") : t("Release Versions");
-  const pageSubtitle = isRootAdmin
-    ? t("Review versioned releases, release documents, and captured library snapshots")
-    : t("Review released versions, release documents, and captured package snapshots");
-  const sortedReleases = useMemo(
-    () => [...releases].sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()),
-    [releases],
+    [],
   );
 
+  const handleClearSearch = useCallback(() => {
+    setSearch("");
+    setFilterData(baseData);
+    setOpenCategories([]);
+  }, [baseData, setSearch]);
+
   useEffect(() => {
-    setSelectedRelease(null);
-    setCreateOpen(false);
-  }, [releaseRegionCode]);
+    if (filterType || getFilterComponent !== "") {
+      setOpen(true);
+      setActiveSection("search");
+    }
+  }, [filterType, getFilterComponent, setOpen]);
+
+  useEffect(() => {
+    setFilterData(finalFilteredData);
+
+    if (
+      search !== "" ||
+      filterType ||
+      getFilterEdge.length > 0 ||
+      getFilterComponent !== ""
+    ) {
+      const newOpenCategories = Object.keys(finalFilteredData).filter(
+        (cat) => Object.keys(finalFilteredData[cat]).length > 0,
+      );
+      setOpenCategories(newOpenCategories);
+    }
+  }, [
+    finalFilteredData,
+    search,
+    filterType,
+    getFilterEdge,
+    setFilterComponent,
+    getFilterComponent,
+  ]);
+
+  useEffect(() => {
+    const options = {
+      keys: [
+        "display_name",
+        "description",
+        "type",
+        "category",
+        "mcpServerName",
+      ],
+      threshold: 0.2,
+      includeScore: true,
+    };
+
+    const fuseData = Object.entries(baseData).flatMap(([category, items]) =>
+      Object.entries(items).map(([key, value]) => ({
+        ...value,
+        category,
+        key,
+      })),
+    );
+
+    // MCP data is already included in baseData, but we still need mcpSearchData for non-search display
+    if (mcpSuccess && mcpServers && data["agents"]?.["MCPTools"]) {
+      const mcpComponent = data["agents"]["MCPTools"];
+      const newMcpSearchData = mcpServers.map((mcpServer) => ({
+        ...mcpComponent,
+        mcpServerName: mcpServer.name, // adds this field and makes it searchable
+        category: "MCP",
+        key: `mcp_${mcpServer.name}`,
+        template: {
+          ...mcpComponent.template,
+          mcp_server: {
+            ...mcpComponent.template.mcp_server,
+            value: mcpServer,
+          },
+        },
+      }));
+
+      setMcpSearchData(newMcpSearchData);
+      // No need to push to fuseData since it's already in baseData
+    } else {
+      setMcpSearchData([]);
+    }
+    setFuse(new Fuse(fuseData, options));
+  }, [baseData, mcpSuccess, mcpServers]);
+
+  useEffect(() => {
+    if (getFilterEdge.length !== 0 || getFilterComponent !== "") {
+      setSearch("");
+    }
+  }, [getFilterEdge, getFilterComponent, baseData]);
+
+  useEffect(() => {
+    if (
+      search === "" &&
+      getFilterEdge.length === 0 &&
+      getFilterComponent === ""
+    ) {
+      setOpenCategories([]);
+    }
+  }, [search, getFilterEdge, getFilterComponent]);
+
+  const searchComponentsSidebar = useShortcutsStore(
+    (state) => state.searchComponentsSidebar,
+  );
+
+  useHotkeys(
+    searchComponentsSidebar,
+    (e: KeyboardEvent) => {
+      if (isWrappedWithClass(e, "noflow")) return;
+      e.preventDefault();
+      searchInputRef.current?.focus();
+      setOpen(true);
+    },
+    {
+      preventDefault: true,
+    },
+  );
+
+  useHotkeys(
+    "esc",
+    (event) => {
+      event.preventDefault();
+      searchInputRef.current?.blur();
+    },
+    {
+      enableOnFormTags: true,
+      enabled: isSearchFocused,
+    },
+  );
+
+  const onDragStart = useCallback(
+    (
+      event: React.DragEvent<any>,
+      data: { type: string; node?: APIClassType },
+    ) => {
+      if (readOnly) return;
+      var crt = event.currentTarget.cloneNode(true);
+      crt.style.position = "absolute";
+      crt.style.width = "215px";
+      crt.style.top = "-500px";
+      crt.style.right = "-500px";
+      crt.classList.add("cursor-grabbing");
+      document.body.appendChild(crt);
+      event.dataTransfer.setDragImage(crt, 0, 0);
+      event.dataTransfer.setData("genericNode", JSON.stringify(data));
+    }, [readOnly]);
+
+  const hasCoreComponents = useMemo(() => {
+    const categoriesWithItems = CATEGORIES.filter(
+      (item) =>
+        dataFilter[item.name] && Object.keys(dataFilter[item.name]).length > 0,
+    );
+    const result = categoriesWithItems.length > 0;
+    return result;
+  }, [dataFilter]);
+
+  const hasBundleItems = useMemo(() => {
+    const bundlesWithItems = BUNDLES.filter(
+      (item) =>
+        dataFilter[item.name] && Object.keys(dataFilter[item.name]).length > 0,
+    );
+    const result = bundlesWithItems.length > 0;
+    return result;
+  }, [dataFilter]);
+
+  const hasMcpComponents = useMemo(() => {
+    return dataFilter["MCP"] && Object.keys(dataFilter["MCP"]).length > 0;
+  }, [dataFilter]);
+
+  const hasMcpServers = Boolean(mcpServers && mcpServers.length > 0);
+
+  const hasSearchInput =
+    search !== "" || filterType !== undefined || getFilterComponent !== "";
+
+  const showComponents =
+    (ENABLE_NEW_SIDEBAR &&
+      hasCoreComponents &&
+      (activeSection === "components" || activeSection === "search")) ||
+    (hasSearchInput && hasCoreComponents && ENABLE_NEW_SIDEBAR) ||
+    !ENABLE_NEW_SIDEBAR;
+  const showBundles =
+    (hasBundleItems && ENABLE_NEW_SIDEBAR && activeSection === "bundles") ||
+    (hasSearchInput && hasBundleItems && ENABLE_NEW_SIDEBAR) ||
+    !ENABLE_NEW_SIDEBAR;
+  const showMcp =
+    (ENABLE_NEW_SIDEBAR && activeSection === "mcp") ||
+    (hasSearchInput && hasMcpComponents && ENABLE_NEW_SIDEBAR);
+
+  const [category, component] = getFilterComponent?.split(".") ?? ["", ""];
+
+  const filterDescription =
+    getFilterComponent !== ""
+      ? (baseData[category][component]?.display_name ?? "")
+      : (filterType?.type ?? "");
+
+  const filterName =
+    getFilterComponent !== ""
+      ? "Component"
+      : filterType
+        ? filterType.source
+          ? "Input"
+          : "Output"
+        : "";
+
+  const resetFilters = useCallback(() => {
+    setFilterEdge([]);
+    setFilterComponent("");
+    setFilterData(baseData);
+  }, [setFilterEdge, setFilterComponent, setFilterData, baseData]);
 
   return (
-    <div className="flex h-full flex-col bg-background">
-      <div className="border-b border-border bg-background px-8 py-5">
-        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
-          <div className="space-y-1">
-            <h1 className="text-xl font-semibold tracking-tight text-foreground md:text-2xl">
-              {pageTitle}
-            </h1>
-            <p className="text-sm text-muted-foreground">
-              {pageSubtitle}
-            </p>
-          </div>
-          <div className="flex flex-wrap items-center gap-3 self-start">
-            {isRootAdmin && regions.length > 1 && (
-              <div className="flex items-center gap-2">
-                <Globe className="h-4 w-4 text-muted-foreground" />
-                <Select value={selectedRegionCode ?? ""} onValueChange={setSelectedRegion}>
-                  <SelectTrigger className="h-9 w-[170px] text-sm">
-                    <SelectValue placeholder={t("Select Region")} />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {regions.map((region) => (
-                      <SelectItem key={region.code} value={region.code}>
-                        {region.name}
-                        {region.is_hub ? " (Hub)" : ""}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-            )}
-            {canPublishRelease && (
-              <Button type="button" onClick={() => setCreateOpen(true)} className="self-start">
-                {t("Create Release")}
-              </Button>
-            )}
-          </div>
-        </div>
-      </div>
+    <Sidebar
+      collapsible="offcanvas"
+      data-testid="shad-sidebar"
+      className={cn("noflow select-none", readOnly && "readonly-sidebar")}
+    >
+      <div className="flex h-full">
+        <div
+          className="flex flex-col h-full w-full group-data-[collapsible=icon]:hidden"
+        >
+          <SidebarHeaderComponent
+            showConfig={showConfig}
+            setShowConfig={setShowConfig}
+            showBeta={showBeta}
+            setShowBeta={handleSetShowBeta}
+            showLegacy={showLegacy}
+            setShowLegacy={handleSetShowLegacy}
+            searchInputRef={searchInputRef}
+            isInputFocused={isSearchFocused}
+            search={search}
+            handleInputFocus={handleInputFocus}
+            handleInputBlur={handleInputBlur}
+            handleInputChange={handleInputChange}
+            filterName={filterName}
+            filterDescription={filterDescription}
+            resetFilters={resetFilters}
+            customComponent={customComponent}
+            addComponent={addComponentSafe}
+            isLoading={Boolean(isLoading)}
+            readOnly={readOnly}
+          />
 
-      {isRootAdmin && isRemoteRegion && selectedRegionCode && (
-        <div className="border-b border-amber-200 bg-amber-50 px-8 py-2.5">
-          <div className="flex items-center justify-between gap-4">
-            <p className="text-xs text-amber-800">
-              {t("Viewing and managing release data for {{region}} from hub.", {
-                region: regions.find((r) => r.code === selectedRegionCode)?.name ?? selectedRegionCode,
-              })}
-            </p>
-            <button
-              type="button"
-              onClick={() => {
-                const hub = regions.find((r) => r.is_hub);
-                if (hub) setSelectedRegion(hub.code);
-              }}
-              className="text-xs font-medium text-amber-700 hover:underline"
-            >
-              {t("Back to Hub")}
-            </button>
-          </div>
-        </div>
-      )}
-
-      <div className="flex-1 overflow-y-auto p-8">
-        <div className="space-y-6">
-          <section className="rounded-lg border border-border bg-card px-6 py-4">
-            <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(0,2fr)] xl:items-center">
-              <div className="min-w-0">
-                <p className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                  {t("Current Release")}
-                </p>
-                {isCurrentLoading ? (
-                  <div className="mt-3 flex items-center gap-3 text-sm text-muted-foreground">
-                    <Loading />
-                  </div>
-                ) : currentRelease ? (
-                  <div className="mt-2 flex flex-wrap items-center gap-3">
-                    <span className="text-2xl font-semibold text-foreground">v{currentRelease.version}</span>
-                    <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-medium text-emerald-700">
-                      {t("Active")}
-                    </span>
-                    <span
-                      className="max-w-[28rem] truncate text-sm text-muted-foreground"
-                      title={currentRelease.release_notes || t("No release summary was provided for the active release.")}
-                    >
-                      {currentRelease.release_notes || t("No release summary was provided for the active release.")}
-                    </span>
-                  </div>
-                ) : (
-                  <p className="mt-2 text-sm text-muted-foreground">{t("No active release found.")}</p>
-                )}
-              </div>
-
-              {currentRelease && (
-                <div className="grid min-w-0 gap-4 sm:grid-cols-[9rem_minmax(0,1fr)_7rem_auto] sm:items-center">
-                  <div>
-                    <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                      {t("Start Date")}
-                    </div>
-                    <div className="mt-1 text-sm text-foreground">{formatDate(currentRelease.start_date)}</div>
-                  </div>
-                  <div className="min-w-0">
-                    <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                      {t("Document")}
-                    </div>
-                    <div className="mt-1 truncate text-sm text-foreground" title={currentRelease.document_file_name || ""}>
-                      {currentRelease.document_file_name || "-"}
-                    </div>
-                  </div>
-                  <div>
-                    <div className="text-[11px] font-semibold uppercase tracking-[0.14em] text-muted-foreground">
-                      {t("Packages")}
-                    </div>
-                    <div className="mt-1 text-sm text-foreground">{currentRelease.package_count ?? "-"}</div>
-                  </div>
-                  <div className="flex sm:justify-end">
-                    <Button type="button" variant="outline" size="sm" onClick={() => setSelectedRelease(currentRelease)}>
-                      {t("View Release")}
-                    </Button>
-                  </div>
+          <SidebarContent
+            segmentedSidebar={false}
+            className="flex-1 group-data-[collapsible=icon]:hidden"
+          >
+            {isLoading ? (
+              <div className="flex flex-col gap-2">
+                <div className="flex flex-col gap-1 p-3">
+                  <SkeletonGroup count={13} className="my-0.5 h-7" />
                 </div>
-              )}
-            </div>
-          </section>
-
-          <section className="space-y-3">
-            <div>
-              <h2 className="text-lg font-semibold text-foreground">{t("Release History")}</h2>
-              <p className="text-sm text-muted-foreground">
-                {t("Open any release to preview the document and review the captured library set.")}
-              </p>
-            </div>
-
-            <div className="rounded-lg border border-border bg-card">
-              <div className="max-h-[58vh] overflow-auto">
-                <table className="w-full min-w-[980px] text-sm">
-                  <thead className="sticky top-0 z-10 bg-card">
-                    <tr className="border-b border-border bg-muted/30 text-xs uppercase tracking-wider text-muted-foreground">
-                      <th className="px-4 py-3 text-left font-semibold">{t("Version")}</th>
-                      <th className="px-4 py-3 text-left font-semibold">{t("Status")}</th>
-                      <th className="px-4 py-3 text-left font-semibold">{t("Document")}</th>
-                      <th className="px-4 py-3 text-left font-semibold">{t("Created")}</th>
-                      <th className="px-4 py-3 text-left font-semibold">{t("Packages")}</th>
-                      <th className="px-4 py-3 text-left font-semibold">{t("Notes")}</th>
-                      <th className="px-4 py-3 text-center font-semibold">{t("Actions")}</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {isReleasesLoading ? (
-                      <tr>
-                        <td colSpan={7} className="px-4 py-12 text-center">
-                          <div className="flex justify-center">
-                            <Loading />
-                          </div>
-                        </td>
-                      </tr>
-                    ) : sortedReleases.length === 0 ? (
-                      <tr>
-                        <td colSpan={7} className="px-4 py-12 text-center text-sm text-muted-foreground">
-                          {t("No releases found")}
-                        </td>
-                      </tr>
-                    ) : (
-                      sortedReleases.map((release) => (
-                        <tr key={release.id} className="border-b border-border/30 align-top last:border-b-0 hover:bg-muted/20">
-                          <td className="px-4 py-4">
-                            <div className="font-medium text-foreground">v{release.version}</div>
-                            <div className="text-xs text-muted-foreground">
-                              {release.major}.{release.minor}.{release.patch}
-                            </div>
-                          </td>
-                          <td className="px-4 py-4">
-                            <span
-                              className={`inline-flex rounded-full px-2.5 py-1 text-xs font-medium ${
-                                release.end_date === ACTIVE_END_DATE
-                                  ? "bg-emerald-100 text-emerald-700"
-                                  : "bg-muted text-muted-foreground"
-                              }`}
-                            >
-                              {release.end_date === ACTIVE_END_DATE ? t("Active") : t("Closed")}
-                            </span>
-                          </td>
-                          <td className="px-4 py-4" title={release.document_file_name || ""}>
-                            <div className="max-w-[280px] truncate text-foreground">
-                              {release.document_file_name || "-"}
-                            </div>
-                            <div className="mt-1 text-xs text-muted-foreground">
-                              {release.has_document ? t("Uploaded") : t("Unavailable")}
-                            </div>
-                          </td>
-                          <td className="px-4 py-4 text-muted-foreground">{formatDate(release.created_at)}</td>
-                          <td className="px-4 py-4 text-foreground">{release.package_count ?? "-"}</td>
-                          <td className="px-4 py-4 text-muted-foreground" title={release.release_notes || ""}>
-                            <div className="max-w-[320px] line-clamp-2 break-words">{release.release_notes || "-"}</div>
-                          </td>
-                          <td className="px-4 py-4 text-center">
-                            <Button type="button" variant="outline" size="sm" onClick={() => setSelectedRelease(release)}>
-                              {t("View")}
-                            </Button>
-                          </td>
-                        </tr>
-                      ))
+                <div className="h-8" />
+                <div className="flex flex-col gap-1 px-3 pt-2">
+                  <SkeletonGroup count={21} className="my-0.5 h-7" />
+                </div>
+              </div>
+            ) : (
+              <>
+                {hasResults ? (
+                  <>
+                    {showComponents && (
+                      <CategoryGroup
+                        dataFilter={dataFilter}
+                        sortedCategories={sortedCategories}
+                        CATEGORIES={CATEGORIES}
+                        openCategories={openCategories}
+                        setOpenCategories={setOpenCategories}
+                        search={search}
+                        nodeColors={nodeColors}
+                        onDragStart={onDragStart}
+                        sensitiveSort={sensitiveSort}
+                        showConfig={showConfig}
+                        setShowConfig={setShowConfig}
+                        readOnly={readOnly}
+                      />
                     )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
-          </section>
+                    {showMcp && (
+                      <McpSidebarGroup
+                        mcpComponents={
+                          hasSearchInput
+                            ? Object.values(dataFilter["MCP"] || {})
+                            : mcpSearchData
+                        }
+                        nodeColors={nodeColors}
+                        onDragStart={onDragStart}
+                        openCategories={openCategories}
+                        mcpLoading={mcpLoading}
+                        mcpSuccess={mcpSuccess}
+                        search={search}
+                        hasMcpServers={hasMcpServers}
+                        showSearchConfigTrigger={
+                          activeSection !== "mcp" &&
+                          !showComponents &&
+                          showBundles
+                        }
+                        showConfig={showConfig}
+                        setShowConfig={setShowConfig}
+                        readOnly={readOnly}
+                      />
+                    )}
+                    
+                    
+                  </>
+                ) : (
+                  <NoResultsMessage
+                    onClearSearch={handleClearSearch}
+                    showConfig={showConfig}
+                    setShowConfig={setShowConfig}
+                  />
+                )}
+              </>
+            )}
+          </SidebarContent>
         </div>
       </div>
-
-      <CreateReleaseDialog open={createOpen} onOpenChange={setCreateOpen} regionCode={releaseRegionCode} />
-      <ViewReleaseDialog
-        key={selectedRelease?.id ?? "release-view-dialog"}
-        release={selectedRelease}
-        regionCode={releaseRegionCode}
-        open={Boolean(selectedRelease)}
-        onOpenChange={(open) => {
-          if (!open) setSelectedRelease(null);
-        }}
-      />
-    </div>
+    </Sidebar>
   );
 }
+
+AgentSidebarComponent.displayName = "AgentSidebarComponent";
+
+export default memo(
+  AgentSidebarComponent,
+  (
+    prevProps: AgentSidebarComponentProps,
+    nextProps: AgentSidebarComponentProps,
+  ) => {
+    return (
+      prevProps.showLegacy === nextProps.showLegacy &&
+      prevProps.setShowLegacy === nextProps.setShowLegacy &&
+      prevProps.readOnly === nextProps.readOnly
+    );
+  },
+);
+
+
+
